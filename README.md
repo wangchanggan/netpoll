@@ -46,3 +46,16 @@ nocopy_linkbuffer.go:814
 ### 性能优化
 * 使用 BinaryInplaceThreshold 阈值（4KB）来决定是否使用拷贝
 * 使用 atomic 操作保证并发安全
+
+[Netpoll]: https://github.com/cloudwego/netpoll
+[net]: https://github.com/golang/go/tree/master/src/net
+[net.Conn]: https://github.com/golang/go/blob/master/src/net/net.go
+[evio]: https://github.com/tidwall/evio
+[gnet]: https://github.com/panjf2000/gnet
+[netty]: https://github.com/netty/netty
+[Kitex]: https://github.com/cloudwego/kitex
+[Hertz]: https://github.com/cloudwego/hertz
+[netpoll-examples]:https://github.com/cloudwego/netpoll-examples
+[ByteDance]: https://www.bytedance.com
+[Redis]: https://redis.io
+[HAProxy]: http://www.haproxy.org
