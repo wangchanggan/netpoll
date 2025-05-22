@@ -36,16 +36,47 @@ nocopy.go:133
 #### ReadWriter
 nocopy.go:220
 
-## LinkBuffer
-nocopy_linkbuffer.go:814
-### 零拷贝优化
-* WriteString 和 WriteBinary 直接引用原始数据，避免拷贝
-* ReadString 使用 unsafeSliceToString 实现零拷贝转换
-* Peek 操作复用缓存，避免重复分配
+## Nocopy LinkBuffer
+基于链表数组实现，将 []byte 数组抽象为 block，并以链表拼接的形式将 block 组合为 Nocopy Buffer，同时引入了引用计数、nocopy API 和对象池。
 
-### 性能优化
-* 使用 BinaryInplaceThreshold 阈值（4KB）来决定是否使用拷贝
-* 使用 atomic 操作保证并发安全
+nocopy_linkbuffer.go:814
+
+优势：
+1. 读写并行无锁，支持 nocopy 地流式读写
+   * 读写分别操作头尾指针，相互不干扰。
+2. 高效扩缩容
+   * 扩容阶段，直接在尾指针后添加新的 block 即可，无需 copy 原数组。
+   * 缩容阶段，头指针会直接释放使用完毕的 block 节点，完成缩容。每个 block 都有独立的引用计数，当释放的 block 不再有引用时，主动回收 block 节点。
+3. 灵活切片和拼接 buffer (链表特性)
+   * 支持任意读取分段(nocopy)，上层代码可以 nocopy 地并行处理数据流分段，无需关心生命周期，通过引用计数 GC。
+   * 支持任意拼接(nocopy)，写 buffer 支持通过 block 拼接到尾指针后的形式，无需 copy，保证数据只写一次。
+4. Nocopy Buffer 池化，减少 GC
+   * 将每个 []byte 数组视为 block 节点，构建对象池维护空闲 block，由此复用 block，减少内存占用和 GC。基于该 Nocopy Buffer，实现了 Nocopy Thrift，使得编解码过程内存零分配零拷贝。
+
+### 优化
+#### string / binary 零拷贝
+直接用 []byte(string) 去转换一个 string 到 []byte 的话实际上是会发生一次拷贝的，原因是 Go 的设计中 string 是 immutable 的但是 []byte 是 mutable 的。
+
+```
+// zero-copy slice convert to string
+func unsafeSliceToString(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+// zero-copy slice convert to string
+func unsafeStringToSlice(s string) (b []byte) {
+	p := unsafe.Pointer((*reflect.StringHeader)(unsafe.Pointer(&s)).Data)
+	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&b))
+	hdr.Data = uintptr(p)
+	hdr.Cap = len(s)
+	hdr.Len = len(s)
+	return b
+}
+```
+
+先把 string 的地址拿到，再拼装上一个 slice byte 的 header。注意：这样生成的 []byte 不可写，否则行为未定义。
+
+
 
 [Netpoll]: https://github.com/cloudwego/netpoll
 [net]: https://github.com/golang/go/tree/master/src/net
