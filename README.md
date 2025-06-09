@@ -77,6 +77,124 @@ func unsafeStringToSlice(s string) (b []byte) {
 先把 string 的地址拿到，再拼装上一个 slice byte 的 header。注意：这样生成的 []byte 不可写，否则行为未定义。
 
 
+## 高效的内存复用mcache
+
+mcache 是一个基于 sync.Pool 的内存池实现，用于提高内存分配性能。它通过预分配和复用内存块来减少频繁的内存分配和垃圾回收开销。
+
+```
+// 使用 46 个 sync.Pool 来管理不同大小的内存块
+const maxSize = 46
+
+// index contains []byte which cap is 1<<index
+var caches [maxSize]sync.Pool
+
+// 对应 Go 运行时中字节切片的内部表示，用于直接操作切片的内存布局。
+type bytesHeader struct {
+	Data *byte
+	Len  int
+	Cap  int
+}
+
+func init() {
+	for i := 0; i < maxSize; i++ {
+		// 内存块大小为 2^i，i 从 0 到 45
+		// 每个 sync.Pool 管理一个固定大小的内存块
+		size := 1 << i
+		// 为每个池设置 New 函数，当池为空时创建新的内存块
+		caches[i].New = func() interface{} {
+			// 使用 dirtmake.Bytes 创建未清零的内存块（性能优化）
+			buf := dirtmake.Bytes(0, size)
+			h := (*bytesHeader)(unsafe.Pointer(&buf))
+			// 只返回内存块的指针部分，节省存储空间
+			return h.Data
+		}
+	}
+}
+
+//go:linkname mallocgc runtime.mallocgc
+func mallocgc(size uintptr, typ unsafe.Pointer, needzero bool) unsafe.Pointer
+
+// 字节分配字节片，但不清除其引用的内存。
+// 如果CAP大于Runtime.MaxAlloc，则抛出致命错误，而不是恐慌。
+// 注意：必须在读取之前设置任何字节元素。
+func Bytes(len, cap int) (b []byte) {
+    if len < 0 || len > cap {
+        panic("dirtmake.Bytes: len out of range")
+    }
+    // 绕过 Go 的 make 函数，直接调用 Go 运行时的内存分配器
+    p := mallocgc(uintptr(cap), nil, false)  // needzero = false，不初始化内存内容，避免不必要的内存清零操作
+    
+    // 构造切片结构
+    sh := (*slice)(unsafe.Pointer(&b))
+    sh.data = p
+    sh.len = len
+    sh.cap = cap
+    return
+}
+```
+
+```
+// 自动计算合适的池索引
+func calcIndex(size int) int {
+	if size == 0 {
+		return 0
+	}
+	// 对于 2 的幂次方
+	if isPowerOfTwo(size) {
+		return bsr(size) // 直接使用对应池
+	}
+	return bsr(size) + 1 // 向上取整到下一个池
+}
+
+// 计算 x 的二进制表示中最高位 1 的位置
+func bsr(x int) int {
+	return bits.Len(uint(x)) - 1
+}
+
+// 判断 x 是否为 2 的幂次方
+func isPowerOfTwo(x int) bool {
+	return (x != 0) && ((x & (-x)) == x)
+}
+
+// Malloc支持一个或两个整数参数。
+// 大小指定返回片段的长度，这意味着 len(ret) == size。
+// 可以提供第二个整数参数来指定最小容量，这意味着 cap(ret) >= cap。
+func Malloc(size int, capacity ...int) []byte {
+	if len(capacity) > 1 {
+		panic("too many arguments to Malloc")
+	}
+	var c = size
+	if len(capacity) > 0 && capacity[0] > size {
+		c = capacity[0]
+	}
+
+	i := calcIndex(c)
+
+	ret := []byte{}
+	// 通过 unsafe 操作直接构造字节切片
+	h := (*bytesHeader)(unsafe.Pointer(&ret))
+	// 返回的切片长度等于请求的 size，容量为 2^i
+	h.Len = size
+	h.Cap = 1 << i
+	h.Data = caches[i].Get().(*byte)
+	return ret
+}
+```
+
+```
+// 当不再使用BUF时，应调用Free
+func Free(buf []byte) {
+	size := cap(buf)
+	if !isPowerOfTwo(size) {
+		// 非 2 的幂次方容量直接丢弃，避免内存污染
+		return
+	}
+	// 只回收容量为 2 的幂次方的切片
+	h := (*bytesHeader)(unsafe.Pointer(&buf))
+	// 只回收内存指针，不回收整个切片结构
+	caches[bsr(size)].Put(h.Data)
+}
+```
 
 [Netpoll]: https://github.com/cloudwego/netpoll
 [net]: https://github.com/golang/go/tree/master/src/net
