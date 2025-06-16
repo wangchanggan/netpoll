@@ -473,53 +473,53 @@ func newWorker() interface{} {
 
 // run 启动工作协程
 func (w *worker) run() {
-	// 启动一个协程，用于执行任务
-	go func() {
-		// 循环执行任务
-		for {
-			// 从任务队列中获取一个任务
-			var t *task
-			// 加锁，防止并发访问任务队列
-			w.pool.taskLock.Lock()
-			// 如果任务队列不为空，则获取任务队列的头节点
-			if w.pool.taskHead != nil {
-				t = w.pool.taskHead
-				// 将任务队列的头节点设置为下一个节点
-				w.pool.taskHead = w.pool.taskHead.next
-				// 减少任务计数
-				atomic.AddInt32(&w.pool.taskCount, -1)
-			}
-			// 如果任务队列为空，则关闭工作协程
-			if t == nil {
-				// 关闭工作协程
-				w.close()
-				w.pool.taskLock.Unlock()
-				w.Recycle()
-				return
-			}
-			// 解锁，允许其他协程访问任务队列
-			w.pool.taskLock.Unlock()
-			// 执行任务
-			func() {
-				// 延迟执行，用于恢复 panic
-				defer func() {
-					if r := recover(); r != nil {
-						// 如果 panic 处理函数不为空，则调用 panic 处理函数
-						if w.pool.panicHandler != nil {
-							w.pool.panicHandler(t.ctx, r)
-						} else {
-							// 如果 panic 处理函数为空，则打印错误信息
-							msg := fmt.Sprintf("GOPOOL: panic in pool: %s: %v: %s", w.pool.name, r, debug.Stack())
-							logger.CtxErrorf(t.ctx, msg)
-						}
-					}
-				}()
-				// 执行任务
-				t.f()
-			}()
-			// 将任务对象放回池中
-			t.Recycle()
-		}
+    // 启动一个协程，用于执行任务
+    go func() {
+	    // 循环执行任务
+	    for {
+	        // 从任务队列中获取一个任务
+	        var t *task
+	        // 加锁，防止并发访问任务队列
+	        w.pool.taskLock.Lock()
+	        // 如果任务队列不为空，则获取任务队列的头节点
+	        if w.pool.taskHead != nil {
+	            t = w.pool.taskHead
+	            // 将任务队列的头节点设置为下一个节点
+	            w.pool.taskHead = w.pool.taskHead.next
+	            // 减少任务计数
+	            atomic.AddInt32(&w.pool.taskCount, -1)
+	        }
+	        // 如果任务队列为空，则关闭工作协程
+	        if t == nil {
+	            // 关闭工作协程
+	            w.close()
+	            w.pool.taskLock.Unlock()
+	            w.Recycle()
+	            return
+	        }
+	        // 解锁，允许其他协程访问任务队列
+	        w.pool.taskLock.Unlock()
+	        // 执行任务
+	        func() {
+	            // 延迟执行，用于恢复 panic
+	            defer func() {
+	                if r := recover(); r != nil {
+	                    // 如果 panic 处理函数不为空，则调用 panic 处理函数
+	                    if w.pool.panicHandler != nil {
+	                        w.pool.panicHandler(t.ctx, r)
+	                    } else {
+	                        // 如果 panic 处理函数为空，则打印错误信息
+	                        msg := fmt.Sprintf("GOPOOL: panic in pool: %s: %v: %s", w.pool.name, r, debug.Stack())
+	                        logger.CtxErrorf(t.ctx, msg)
+	                    }
+	                }
+	            }()
+	            // 执行任务
+	            t.f()
+	        }()
+	        // 将任务对象放回池中
+	        t.Recycle()
+	    }
 	}()
 }
 
