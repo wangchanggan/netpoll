@@ -77,7 +77,7 @@ func unsafeStringToSlice(s string) (b []byte) {
 先把 string 的地址拿到，再拼装上一个 slice byte 的 header。注意：这样生成的 []byte 不可写，否则行为未定义。
 
 
-## 高效的内存复用mcache
+## 高效的内存复用[mcache][mcache]
 
 mcache 是一个基于 sync.Pool 的内存池实现，用于提高内存分配性能。它通过预分配和复用内存块来减少频繁的内存分配和垃圾回收开销。
 
@@ -196,6 +196,351 @@ func Free(buf []byte) {
 }
 ```
 
+
+## 高性能goroutine池[gopool][gopool]
+一个高性能的协程池实现，主要目标是重用协程并限制协程数量。它提供了以下特性：
+1. 高性能
+2. 自动恢复 panic
+3. 限制协程数量
+4. 重用协程栈
+
+### 配置
+```
+const (
+	// 默认的扩容阈值常量
+	defaultScalaThreshold = 1
+)
+
+// Config 用于配置池
+type Config struct {
+	// 用于控制何时创建新的工作协程
+	// 当任务队列长度超过这个阈值时，会触发创建新的工作协程
+	ScaleThreshold int32
+}
+
+// NewConfig 创建一个默认的 Config
+func NewConfig() *Config {
+	c := &Config{
+		ScaleThreshold: defaultScalaThreshold,
+	}
+	return c
+}
+```
+
+### 主入口
+
+```
+// defaultPool 全局默认池
+var defaultPool Pool
+
+// poolMap 用于存储所有注册的池
+var poolMap sync.Map
+
+func init() {
+	// 初始化全局默认池，使用最大协程数限制和默认配置
+	defaultPool = NewPool("gopool.DefaultPool", math.MaxInt32, NewConfig())
+}
+
+// Go 是 Go 关键字的替代品，能够恢复 panic
+func Go(f func()) {
+	CtxGo(context.Background(), f)
+}
+
+// CtxGo 比 Go 更推荐使用，支持传入自定义 context
+func CtxGo(ctx context.Context, f func()) {
+	defaultPool.CtxGo(ctx, f)
+}
+
+// SetCap 不推荐使用，修改全局池的容量限制，会影响其他调用者
+func SetCap(cap int32) {
+	defaultPool.SetCap(cap)
+}
+
+// SetPanicHandler 设置全局池的 panic 处理函数
+func SetPanicHandler(f func(context.Context, interface{})) {
+	defaultPool.SetPanicHandler(f)
+}
+
+// WorkerCount 返回全局默认池的运行中协程数量
+func WorkerCount() int32 {
+	return defaultPool.WorkerCount()
+}
+
+// RegisterPool 注册一个新的池到全局池映射中
+// GetPool 可以用来根据名称获取已注册的池
+// 如果名称已存在，则返回错误
+func RegisterPool(p Pool) error {
+	_, loaded := poolMap.LoadOrStore(p.Name(), p)
+	if loaded {
+		return fmt.Errorf("name: %s already registered", p.Name())
+	}
+	return nil
+}
+
+// GetPool 根据名称获取已注册的池
+// 如果未注册，则返回 nil
+func GetPool(name string) Pool {
+	p, ok := poolMap.Load(name)
+	if !ok {
+		return nil
+	}
+	return p.(Pool)
+}
+```
+
+### 协程池的核心实现
+```
+type Pool interface {
+	// 获取池的名称
+	Name() string
+	// 设置池的协程容量
+	SetCap(cap int32)
+	// 执行任务
+	Go(f func())
+	// 执行任务并传递上下文
+	CtxGo(ctx context.Context, f func())
+	// 设置 panic 处理函数
+	SetPanicHandler(f func(context.Context, interface{}))
+	// 获取运行中的协程数量
+	WorkerCount() int32
+}
+
+// taskPool 使用 sync.Pool 复用 task 对象，减少 GC 压力
+var taskPool sync.Pool
+
+// init 初始化 taskPool
+func init() {
+	taskPool.New = newTask
+}
+
+// task 表示一个任务
+type task struct {
+	// 任务的上下文
+	ctx context.Context
+	// 任务的执行函数
+	f func()
+	// 下一个任务
+	next *task
+}
+
+// zero 将任务对象重置为初始状态
+func (t *task) zero() {
+	t.ctx = nil
+	t.f = nil
+	t.next = nil
+}
+
+// Recycle 将任务对象放回池中
+func (t *task) Recycle() {
+	t.zero()
+	taskPool.Put(t)
+}
+
+// newTask 创建一个新的任务对象
+func newTask() interface{} {
+	return &task{}
+}
+
+// taskList 用于存储任务队列
+type taskList struct {
+	sync.Mutex
+	// 任务队列的头节点
+	taskHead *task
+	// 任务队列的尾节点
+	taskTail *task
+}
+
+// pool 表示一个协程池
+type pool struct {
+	// 池的名称
+	name string
+
+	// 池的协程容量，即最大并发协程数
+	cap int32
+	// 池的配置信息
+	config *Config
+	// 任务队列
+	taskHead  *task
+	taskTail  *task
+	taskLock  sync.Mutex
+	taskCount int32
+
+	// 记录运行中的协程数量
+	workerCount int32
+
+	// 当协程 panic 时调用的处理函数
+	panicHandler func(context.Context, interface{})
+}
+
+// NewPool 创建一个新的池
+func NewPool(name string, cap int32, config *Config) Pool {
+	p := &pool{
+		name:   name,
+		cap:    cap,
+		config: config,
+	}
+	return p
+}
+
+// Name 获取池的名称
+func (p *pool) Name() string {
+	return p.name
+}
+
+// SetCap 设置池的协程容量
+func (p *pool) SetCap(cap int32) {
+	atomic.StoreInt32(&p.cap, cap)
+}
+
+// Go 执行任务
+func (p *pool) Go(f func()) {
+	p.CtxGo(context.Background(), f)
+}
+
+// CtxGo 执行任务并传递上下文
+func (p *pool) CtxGo(ctx context.Context, f func()) {
+	// 从池中获取一个任务对象
+	t := taskPool.Get().(*task)
+	// 设置任务的上下文和执行函数
+	t.ctx = ctx
+	t.f = f
+
+	p.taskLock.Lock()
+	// 如果任务队列为空，则将任务设置为头节点和尾节点
+	if p.taskHead == nil {
+		p.taskHead = t
+		p.taskTail = t
+	} else {
+		// 否则将任务添加到任务队列的末尾
+		p.taskTail.next = t
+		p.taskTail = t
+	}
+	// 增加任务计数
+	atomic.AddInt32(&p.taskCount, 1)
+	p.taskLock.Unlock()
+
+	// 当以下两个条件满足时，会创建新的工作协程：
+	// 1. 任务队列长度超过阈值，且当前运行中的协程数小于最大并发数限制
+	// 2. 当前没有运行中的协程
+	if (atomic.LoadInt32(&p.taskCount) >= p.config.ScaleThreshold && p.WorkerCount() < atomic.LoadInt32(&p.cap)) || p.WorkerCount() == 0 {
+		p.incWorkerCount()
+		w := workerPool.Get().(*worker)
+		w.pool = p
+		w.run()
+	}
+}
+
+// SetPanicHandler 设置 panic 处理函数
+func (p *pool) SetPanicHandler(f func(context.Context, interface{})) {
+	p.panicHandler = f
+}
+
+// WorkerCount 获取运行中的协程数量
+func (p *pool) WorkerCount() int32 {
+	return atomic.LoadInt32(&p.workerCount)
+}
+
+// incWorkerCount 增加运行中的协程数量
+func (p *pool) incWorkerCount() {
+	atomic.AddInt32(&p.workerCount, 1)
+}
+
+// decWorkerCount 减少运行中的协程数量
+func (p *pool) decWorkerCount() {
+	atomic.AddInt32(&p.workerCount, -1)
+}
+```
+
+### 工作协程的实现
+```
+// workerPool 使用 sync.Pool 复用 worker 对象，减少 GC 压力
+var workerPool sync.Pool
+
+// init 初始化 workerPool
+func init() {
+	workerPool.New = newWorker
+}
+
+// worker 表示一个工作协程
+type worker struct {
+	pool *pool
+}
+
+// newWorker 创建一个新的 worker 对象		
+func newWorker() interface{} {
+	return &worker{}
+}
+
+// run 启动工作协程
+func (w *worker) run() {
+	// 启动一个协程，用于执行任务
+	go func() {
+		// 循环执行任务
+		for {
+			// 从任务队列中获取一个任务
+			var t *task
+			// 加锁，防止并发访问任务队列
+			w.pool.taskLock.Lock()
+			// 如果任务队列不为空，则获取任务队列的头节点
+			if w.pool.taskHead != nil {
+				t = w.pool.taskHead
+				// 将任务队列的头节点设置为下一个节点
+				w.pool.taskHead = w.pool.taskHead.next
+				// 减少任务计数
+				atomic.AddInt32(&w.pool.taskCount, -1)
+			}
+			// 如果任务队列为空，则关闭工作协程
+			if t == nil {
+				// 关闭工作协程
+				w.close()
+				w.pool.taskLock.Unlock()
+				w.Recycle()
+				return
+			}
+			// 解锁，允许其他协程访问任务队列
+			w.pool.taskLock.Unlock()
+			// 执行任务
+			func() {
+				// 延迟执行，用于恢复 panic
+				defer func() {
+					if r := recover(); r != nil {
+						// 如果 panic 处理函数不为空，则调用 panic 处理函数
+						if w.pool.panicHandler != nil {
+							w.pool.panicHandler(t.ctx, r)
+						} else {
+							// 如果 panic 处理函数为空，则打印错误信息
+							msg := fmt.Sprintf("GOPOOL: panic in pool: %s: %v: %s", w.pool.name, r, debug.Stack())
+							logger.CtxErrorf(t.ctx, msg)
+						}
+					}
+				}()
+				// 执行任务
+				t.f()
+			}()
+			// 将任务对象放回池中
+			t.Recycle()
+		}
+	}()
+}
+
+// close 关闭工作协程
+func (w *worker) close() {
+	w.pool.decWorkerCount()
+}
+
+// zero 重置 worker 对象
+func (w *worker) zero() {
+	w.pool = nil
+}
+
+// Recycle 将 worker 对象放回池中
+func (w *worker) Recycle() {
+	w.zero()
+	workerPool.Put(w)
+}
+```
+
+
 [Netpoll]: https://github.com/cloudwego/netpoll
 [net]: https://github.com/golang/go/tree/master/src/net
 [net.Conn]: https://github.com/golang/go/blob/master/src/net/net.go
@@ -208,3 +553,6 @@ func Free(buf []byte) {
 [ByteDance]: https://www.bytedance.com
 [Redis]: https://redis.io
 [HAProxy]: http://www.haproxy.org
+
+[gopool]: https://github.com/bytedance/gopkg/tree/develop/util/gopool
+[mcache]: https://github.com/bytedance/gopkg/tree/develop/lang/mcache
